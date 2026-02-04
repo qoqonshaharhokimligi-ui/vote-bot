@@ -1,6 +1,7 @@
 import os
+import csv
+import io
 import re
-import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple
 
@@ -11,84 +12,83 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ===================== CONFIG =====================
+
+# ----------------- CONFIG -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ga BOT_TOKEN qo‘ying.")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL topilmadi. Railway Postgres ulab, vote-bot service Variables ga DATABASE_URL qo‘ying.")
 
-# Adminlar ro‘yxati (user_id)
-ADMINS = [32257986]
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable topilmadi")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable topilmadi")
+
+ADMINS = [32257986]  # <-- o'zingizniki
 
 UTC = timezone.utc
 
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot, storage=MemoryStorage())
 
-pool: asyncpg.Pool = None  # type: ignore
+db_pool: Optional[asyncpg.Pool] = None
 
-# ===================== DB INIT =====================
-DDL = """
-CREATE TABLE IF NOT EXISTS channels(
-    chat_id TEXT PRIMARY KEY,     -- '@kanal' yoki '-100...'
-    join_url TEXT                 -- ixtiyoriy (private kanal uchun majburiy)
-);
-
-CREATE TABLE IF NOT EXISTS candidates(
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS votes(
-    user_id BIGINT PRIMARY KEY,
-    candidate_id INT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-    ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS settings(
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
-# ===================== FSM =====================
+# FSM faqat remove/timer/channel uchun
 class AdminState(StatesGroup):
     add_channel = State()
     remove_channel = State()
-    add_candidate = State()
     remove_candidate = State()
     set_timer = State()
 
-# ===================== Helpers =====================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
+# FSMsiz bulk add uchun "mode"
+ADD_CANDIDATE_MODE = set()  # admin user_id lar
+
+
+# ----------------- DB HELPERS -----------------
+def is_admin(uid: int) -> bool:
+    return uid in ADMINS
 
 def now_utc() -> datetime:
     return datetime.now(UTC)
 
-async def db_exec(query: str, *args):
-    async with pool.acquire() as con:
-        await con.execute(query, *args)
-
 async def db_fetch(query: str, *args):
-    async with pool.acquire() as con:
-        return await con.fetch(query, *args)
+    assert db_pool is not None
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(query, *args)
 
 async def db_fetchrow(query: str, *args):
-    async with pool.acquire() as con:
-        return await con.fetchrow(query, *args)
+    assert db_pool is not None
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(query, *args)
+
+async def db_fetchval(query: str, *args):
+    assert db_pool is not None
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(query, *args)
+
+async def db_execute(query: str, *args):
+    assert db_pool is not None
+    async with db_pool.acquire() as conn:
+        return await conn.execute(query, *args)
+
+
+# ----------------- SETTINGS / TIMER -----------------
+async def get_setting(key: str) -> Optional[str]:
+    return await db_fetchval("SELECT value FROM settings WHERE key=$1", key)
+
+async def set_setting(key: str, value: Optional[str]) -> None:
+    if value is None:
+        await db_execute("DELETE FROM settings WHERE key=$1", key)
+        return
+    await db_execute("""
+        INSERT INTO settings(key, value) VALUES($1, $2)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+    """, key, value)
 
 async def get_end_time() -> Optional[datetime]:
-    row = await db_fetchrow("SELECT value FROM settings WHERE key='end_time_utc'")
-    if not row or not row["value"]:
+    v = await get_setting("end_time_utc")
+    if not v:
         return None
     try:
-        # ISO format saqlangan bo‘ladi
-        return datetime.fromisoformat(row["value"])
+        return datetime.fromisoformat(v)
     except Exception:
         return None
 
@@ -101,30 +101,31 @@ async def voting_is_open() -> bool:
 async def remaining_time_text() -> str:
     end_time = await get_end_time()
     if not end_time:
-        return "⏳ Taymer: o‘rnatilmagan (ovoz berish ochiq)"
+        return "⏳ Таймер: ўрнатилмаган (овоз бериш очиқ)"
     delta = end_time - now_utc()
     if delta.total_seconds() <= 0:
-        return "⏳ Taymer: tugagan (ovoz berish yopiq)"
+        return "⏳ Таймер: тугаган (овоз бериш ёпиқ)"
     mins = int(delta.total_seconds() // 60)
     secs = int(delta.total_seconds() % 60)
-    return f"⏳ Qolgan vaqt: <b>{mins:02d}:{secs:02d}</b>"
+    return f"⏳ Қолган вақт: <b>{mins:02d}:{secs:02d}</b>"
 
-def parse_channel_input(text: str) -> Tuple[str, Optional[str]]:
+
+# ----------------- CHANNEL NORMALIZE -----------------
+def normalize_channel_input(raw: str) -> Tuple[str, Optional[str]]:
     """
-    Qabul qiladi:
+    Accepts:
       @username
-      -100123...
       https://t.me/username
       t.me/username
+      -100123... (private)
       -100123... https://t.me/+invite
-      @username https://t.me/username
-    Natija: (chat_id, join_url)
+    Returns: (chat_id, join_url)
     """
-    parts = text.strip().split()
+    parts = raw.strip().split()
     first = parts[0].strip()
     join_url = parts[1].strip() if len(parts) > 1 else None
 
-    # URL bo‘lsa username ni ajratamiz
+    # URL -> @username
     m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)/?$", first)
     if m:
         username = m.group(1)
@@ -133,24 +134,23 @@ def parse_channel_input(text: str) -> Tuple[str, Optional[str]]:
             join_url = f"https://t.me/{username}"
         return chat_id, join_url
 
-    # @username bo‘lsa
     if first.startswith("@"):
         chat_id = first
         if not join_url:
             join_url = f"https://t.me/{first.lstrip('@')}"
         return chat_id, join_url
 
-    # -100... bo‘lsa (private kanal)
     if re.fullmatch(r"-100\d{5,}", first):
-        chat_id = first
-        return chat_id, join_url  # private uchun join_url tavsiya/kerak bo‘lishi mumkin
+        # private kanal: join_url bo‘lsa yaxshi
+        return first, join_url
 
-    # Aks holda xato
-    raise ValueError("Kanal formati noto‘g‘ri")
+    raise ValueError("Канал формати нотўғри")
 
+
+# ----------------- SUBSCRIBE CHECK -----------------
 async def get_channels() -> List[Tuple[str, Optional[str]]]:
-    rows = await db_fetch("SELECT chat_id, join_url FROM channels ORDER BY chat_id ASC")
-    return [(r["chat_id"], r["join_url"]) for r in rows]
+    rows = await db_fetch("SELECT chat_id, join_url FROM channels ORDER BY created_at DESC")
+    return [(str(r["chat_id"]), (str(r["join_url"]) if r["join_url"] else None)) for r in rows]
 
 async def is_subscribed(user_id: int) -> bool:
     channels = await get_channels()
@@ -163,7 +163,7 @@ async def is_subscribed(user_id: int) -> bool:
             if member.status in ("left", "kicked"):
                 return False
         except Exception:
-            # Bot kanalga admin bo‘lmasa yoki chat_id noto‘g‘ri bo‘lsa xato bo‘lishi mumkin
+            # bot kanalga admin bo‘lmasa yoki chat_id noto‘g‘ri bo‘lsa
             return False
     return True
 
@@ -173,187 +173,208 @@ def subscribe_kb(channels: List[Tuple[str, Optional[str]]]) -> InlineKeyboardMar
     has_any = False
     for chat_id, join_url in channels:
         url = join_url
-        if not url and isinstance(chat_id, str) and chat_id.startswith("@"):
+        if not url and chat_id.startswith("@"):
             url = f"https://t.me/{chat_id.lstrip('@')}"
         if url:
             has_any = True
-            kb.add(InlineKeyboardButton(text=f"➕ Obuna bo‘lish: {chat_id}", url=url))
+            kb.add(InlineKeyboardButton(text=f"➕ Обуна бўлиш: {chat_id}", url=url))
 
     if not has_any:
-        kb.add(InlineKeyboardButton("⚠️ Kanal linki yo‘q (admin link qo‘shsin)", callback_data="noop"))
+        kb.add(InlineKeyboardButton("⚠️ Канал линклари йўқ (админ қўшсин)", callback_data="noop"))
 
-    kb.add(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub"))
+    kb.add(InlineKeyboardButton(text="✅ Текшириш", callback_data="check_sub"))
     return kb
 
+
+# ----------------- VOTE UI (REAL-TIME COUNTS) -----------------
 async def candidates_with_counts() -> List[Tuple[int, str, int]]:
     rows = await db_fetch("""
-        SELECT c.id AS id, c.name AS name, COUNT(v.candidate_id) AS cnt
+        SELECT c.id, c.name, COUNT(v.user_id) AS cnt
         FROM candidates c
         LEFT JOIN votes v ON v.candidate_id = c.id
-        GROUP BY c.id
+        GROUP BY c.id, c.name
         ORDER BY c.id ASC
     """)
     return [(int(r["id"]), str(r["name"]), int(r["cnt"])) for r in rows]
 
 async def total_votes() -> int:
-    row = await db_fetchrow("SELECT COUNT(*) AS c FROM votes")
-    return int(row["c"]) if row else 0
+    v = await db_fetchval("SELECT COUNT(*) FROM votes")
+    return int(v or 0)
+
+def safe_btn_text(s: str, max_len: int = 60) -> str:
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+
+async def vote_kb(disabled: bool = False) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    rows = await candidates_with_counts()
+    total = sum(cnt for _cid, _n, cnt in rows)
+
+    if not rows:
+        kb.add(InlineKeyboardButton("⛔ Номзодлар йўқ (админ қўшади)", callback_data="noop"))
+        return kb
+
+    for idx, (cid, name, cnt) in enumerate(rows, start=1):
+        pct = int((cnt / total) * 100) if total > 0 else 0
+        text = safe_btn_text(f"{idx}. {name} | {cnt} та | {pct}%")
+        cb = "noop" if disabled else f"v:{cid}"
+        kb.add(InlineKeyboardButton(text=text, callback_data=cb))
+
+    return kb
 
 async def voting_message_text() -> str:
-    open_state = "✅ Ovoz berish: <b>ochiq</b>" if (await voting_is_open()) else "⛔ Ovoz berish: <b>yopiq</b>"
+    open_state = "✅ Овоз бериш: <b>очиқ</b>" if await voting_is_open() else "🚫 Овоз бериш: <b>ёпиқ</b>"
     return (
-        "🗳 <b>Ovoz berish</b>\n\n"
-        "Nomzodni tanlang:\n\n"
-        f"🧮 Jami ovozlar: <b>{await total_votes()}</b>\n"
+        "🗳 <b>Овоз бериш</b>\n"
+        "Номзодни танланг (real-time):\n\n"
+        f"🧮 Жами овоз: <b>{await total_votes()}</b>\n"
         f"{await remaining_time_text()}\n"
         f"{open_state}"
     )
 
-async def live_vote_kb(disabled: bool = False) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
+
+# ----------------- RESULTS AS BUTTONS (rank+name+votes+%) -----------------
+async def results_text_and_buttons() -> Tuple[str, InlineKeyboardMarkup]:
     rows = await candidates_with_counts()
+    total = sum(cnt for _cid, _n, cnt in rows)
 
     if not rows:
-        kb.add(InlineKeyboardButton("⛔ Nomzodlar yo‘q (admin qo‘shadi)", callback_data="noop"))
-        return kb
+        text = "📊 <b>Натижалар</b>\n\n❌ Номзодлар қўшилмаган."
+        return text, InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Админ", callback_data="a:back"))
 
-    # 2 ustun qilib chiqamiz: [btn, btn] satrlar
-    buttons = []
-    for idx, (cid, name, cnt) in enumerate(rows, start=1):
-        cb = "noop" if disabled else f"vote:{cid}"
-        text = f"{idx}. {name} • {cnt}"
-        buttons.append(InlineKeyboardButton(text=text, callback_data=cb))
+    # sort by votes desc
+    sorted_rows = sorted(rows, key=lambda x: (-x[2], x[0]))
 
-    # row_width=2 bo‘lsa ham, o‘zimiz aniq qo‘shamiz
-    for i in range(0, len(buttons), 2):
-        if i + 1 < len(buttons):
-            kb.row(buttons[i], buttons[i + 1])
+    if total == 0:
+        head = (
+            "📊 <b>Натижалар</b>\n"
+            f"🧮 Жами овоз: <b>0</b>\n\n"
+            "Ҳозирча овоз берилмаган. Номзодлар кесимида 0 натижа кўрсатилмоқда:"
+        )
+    else:
+        head = (
+            "📊 <b>Натижалар</b>\n"
+            f"🧮 Жами овоз: <b>{total}</b>\n\n"
+            "Номзодлар кесимида натижалар:"
+        )
+
+    # deep link uchun bot username
+    me = await bot.get_me()
+    bot_username = me.username
+
+    kb = InlineKeyboardMarkup(row_width=1)
+
+    for rank, (cid, name, cnt) in enumerate(sorted_rows, start=1):
+        pct = int((cnt / total) * 100) if total > 0 else 0
+        label = safe_btn_text(f"{rank}. {name} | {cnt} та | {pct}%")
+
+        if bot_username:
+            url = f"https://t.me/{bot_username}?start=c{cid}"
+            kb.add(InlineKeyboardButton(text=label, url=url))
         else:
-            kb.row(buttons[i])
+            kb.add(InlineKeyboardButton(text=label, callback_data=f"open_c:{cid}"))
 
-    return kb
+    # actions
+    kb.add(InlineKeyboardButton("🔄 Янгилаш", callback_data="refresh_results"))
+    kb.add(InlineKeyboardButton("🗳 Овоз бериш", callback_data="open_vote"))
 
+    return head, kb
+
+
+# ----------------- ADMIN PANEL -----------------
 def admin_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("➕ Kanal", callback_data="a:add_channel"),
-        InlineKeyboardButton("➖ Kanal", callback_data="a:rm_channel"),
+        InlineKeyboardButton("➕ Канал", callback_data="a:add_channel"),
+        InlineKeyboardButton("➖ Канал", callback_data="a:rm_channel"),
     )
     kb.add(
-        InlineKeyboardButton("📃 Kanallar", callback_data="a:list_channels"),
-        InlineKeyboardButton("📃 Nomzodlar", callback_data="a:list_candidates"),
+        InlineKeyboardButton("📃 Каналлар", callback_data="a:list_channels"),
+        InlineKeyboardButton("📃 Номзодлар", callback_data="a:list_candidates"),
     )
     kb.add(
-        InlineKeyboardButton("➕ Nomzod", callback_data="a:add_candidate"),
-        InlineKeyboardButton("➖ Nomzod", callback_data="a:rm_candidate"),
+        InlineKeyboardButton("➕ Номзод", callback_data="a:add_candidate"),
+        InlineKeyboardButton("➖ Номзод", callback_data="a:rm_candidate"),
     )
     kb.add(
-        InlineKeyboardButton("⏳ Taymer (daq)", callback_data="a:set_timer"),
-        InlineKeyboardButton("🛑 Taymer stop", callback_data="a:stop_timer"),
+        InlineKeyboardButton("⏳ Таймер (daq)", callback_data="a:set_timer"),
+        InlineKeyboardButton("🛑 Таймер stop", callback_data="a:timer_stop"),
     )
     kb.add(
-        InlineKeyboardButton("📊 Natijalar", callback_data="a:results"),
-        InlineKeyboardButton("🗑 Ovozlarni 0 qilish", callback_data="a:reset_votes"),
+        InlineKeyboardButton("📊 Натижалар", callback_data="a:results"),
+        InlineKeyboardButton("🗑 Овозларни 0 қилиш", callback_data="a:reset_votes"),
+    )
+    kb.add(
+        InlineKeyboardButton("📤 Export CSV", callback_data="a:export_csv"),
+        InlineKeyboardButton("♻️ Back", callback_data="a:back"),
     )
     return kb
 
-def deep_link_for_candidate(me_username: Optional[str], cid: int) -> Optional[str]:
-    if not me_username:
-        return None
-    # /start c<id> orqali o‘tadi
-    return f"https://t.me/{me_username}?start=c{cid}"
 
-def bar(pct: float, width: int = 12) -> str:
-    # oddiy progress bar
-    filled = int(round(pct / 100 * width))
-    filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
-
-async def results_text_and_kb() -> Tuple[str, InlineKeyboardMarkup]:
-    rows = await candidates_with_counts()
-    total = sum(cnt for _cid, _name, cnt in rows)
-
-    if not rows:
-        return ("Natija yo‘q (nomzodlar yo‘q).", InlineKeyboardMarkup())
-
-    # Bot username (deep link uchun)
-    me = await bot.get_me()
-    me_username = me.username
-
-    text = "<b>📊 Natijalar (real time)</b>\n"
-    text += f"🧮 Jami ovoz: <b>{total}</b>\n"
-    text += f"{await remaining_time_text()}\n\n"
-
-    # Natijani cnt bo‘yicha saralaymiz
-    sorted_rows = sorted(rows, key=lambda x: (-x[2], x[0]))
-
-    for rank, (cid, name, cnt) in enumerate(sorted_rows, start=1):
-        pct = (cnt / total * 100) if total else 0.0
-        text += f"{rank}. <b>{name}</b> — <b>{cnt}</b> ({pct:.1f}%)\n"
-        text += f"   {bar(pct)}\n"
-
-    text += "\n<i>Nomzodni bosib botga o‘tib ovoz berishingiz mumkin.</i>"
-
-    kb = InlineKeyboardMarkup(row_width=2)
-    # klaviaturaga nomzodlar: bosilganda botga deep link
-    btns = []
-    for idx, (cid, name, cnt) in enumerate(rows, start=1):
-        url = deep_link_for_candidate(me_username, cid)
-        label = f"{idx}. {cnt}"
-        if url:
-            btns.append(InlineKeyboardButton(text=label, url=url))
-        else:
-            # fallback
-            btns.append(InlineKeyboardButton(text=label, callback_data=f"open_c:{cid}"))
-
-    for i in range(0, len(btns), 2):
-        if i + 1 < len(btns):
-            kb.row(btns[i], btns[i + 1])
-        else:
-            kb.row(btns[i])
-
-    return text, kb
-
-# ===================== USER FLOW =====================
+# ----------------- START / SUBSCRIBE FLOW -----------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
     args = (m.get_args() or "").strip()
-    # deep link: c<id>
+
+    # deep link: /start c<ID>
     if args.startswith("c") and args[1:].isdigit():
         cid = int(args[1:])
-        # nomzodni tekshiramiz
-        row = await db_fetchrow("SELECT id, name FROM candidates WHERE id=$1", cid)
-        if not row:
-            await m.answer("❗ Nomzod topilmadi.")
-            return
 
-        # Avval obuna bo‘lish shart
+        # obuna tekshiruv (admin ham, user ham)
         channels = await get_channels()
         if not await is_subscribed(m.from_user.id):
             await m.answer(
-                "❗ Ovoz berish uchun avval quyidagi kanal(lar)ga obuna bo‘ling va <b>✅ Tekshirish</b>ni bosing:",
-                reply_markup=subscribe_kb(channels),
+                "🔒 Давом этиш учун қуйидаги каналларга обуна бўлинг ва <b>✅ Текшириш</b>ни босинг:",
+                reply_markup=subscribe_kb(channels)
             )
             return
 
         if not await voting_is_open():
-            await m.answer("⛔ Ovoz berish yakunlangan.")
+            await m.answer(f"🚫 Овоз бериш ёпиқ.\n\n{await remaining_time_text()}")
             return
 
+        # candidate exists?
+        row = await db_fetchrow("SELECT id, name FROM candidates WHERE id=$1", cid)
+        if not row:
+            await m.answer("❌ Номзод топилмади.")
+            return
+
+        # show voting with highlight button
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton(f"✅ {row['name']} учун овоз бериш", callback_data=f"v:{cid}"))
+        kb.add(InlineKeyboardButton("⬅️ Барча номзодлар", callback_data="open_vote"))
+        await m.answer("🗳 <b>Номзодга овоз бериш</b>\nТасдиқланг:", reply_markup=kb)
+        return
+
+    # default start:
+    channels = await get_channels()
+    if not await is_subscribed(m.from_user.id):
         await m.answer(
-            f"🗳 Nomzod: <b>{row['name']}</b>\n\nOvoz berishni tasdiqlang:",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("✅ Ovoz berish", callback_data=f"vote:{cid}")
-            ),
+            "🔒 Давом этиш учун қуйидаги каналларга обуна бўлинг ва <b>✅ Текшириш</b>ни босинг:",
+            reply_markup=subscribe_kb(channels)
         )
         return
 
-    await m.answer(
-        "Assalomu alaykum!\n\nOvoz berish uchun quyidagi tugmani bosing:",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🗳 Ovoz berish", callback_data="open_vote")
-        ),
-    )
+    if not await voting_is_open():
+        await m.answer(f"🚫 Овоз бериш ёпиқ.\n\n{await remaining_time_text()}")
+        return
+
+    await m.answer(await voting_message_text(), reply_markup=await vote_kb(disabled=False))
+
+
+@dp.callback_query_handler(lambda c: c.data == "check_sub")
+async def cb_check_sub(c: types.CallbackQuery):
+    ok = await is_subscribed(c.from_user.id)
+    if not ok:
+        await c.answer("Ҳали обуна эмассиз (бот каналларда admin бўлиши керак)", show_alert=True)
+        return
+    await c.answer("✅ Обуна тасдиқланди", show_alert=True)
+    # show voting
+    if not await voting_is_open():
+        await c.message.answer(f"🚫 Овоз бериш ёпиқ.\n\n{await remaining_time_text()}")
+        return
+    await c.message.answer(await voting_message_text(), reply_markup=await vote_kb(disabled=False))
+
 
 @dp.callback_query_handler(lambda c: c.data == "open_vote")
 async def cb_open_vote(c: types.CallbackQuery):
@@ -361,291 +382,426 @@ async def cb_open_vote(c: types.CallbackQuery):
     channels = await get_channels()
     if not await is_subscribed(c.from_user.id):
         await c.message.answer(
-            "❗ Ovoz berish uchun avval quyidagi kanal(lar)ga obuna bo‘ling va <b>✅ Tekshirish</b>ni bosing:",
-            reply_markup=subscribe_kb(channels),
-        )
-        return
-    await c.message.answer(await voting_message_text(), reply_markup=await live_vote_kb(disabled=not (await voting_is_open())))
-
-@dp.callback_query_handler(lambda c: c.data == "check_sub")
-async def cb_check_sub(c: types.CallbackQuery):
-    ok = await is_subscribed(c.from_user.id)
-    if ok:
-        await c.answer("✅ Obuna tasdiqlandi!", show_alert=True)
-        await c.message.answer(await voting_message_text(), reply_markup=await live_vote_kb(disabled=not (await voting_is_open())))
-    else:
-        await c.answer("❗ Avval barcha kanallarga obuna bo‘ling.\n(Bot kanallarda admin bo‘lishi kerak)", show_alert=True)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("open_c:"))
-async def cb_open_candidate_fallback(c: types.CallbackQuery):
-    # deep link bo‘lmaganda fallback: shu chatda nomzod oynasi
-    await c.answer()
-    cid = int(c.data.split(":")[1])
-    row = await db_fetchrow("SELECT id, name FROM candidates WHERE id=$1", cid)
-    if not row:
-        await c.message.answer("❗ Nomzod topilmadi.")
-        return
-
-    channels = await get_channels()
-    if not await is_subscribed(c.from_user.id):
-        await c.message.answer(
-            "❗ Ovoz berish uchun avval quyidagi kanal(lar)ga obuna bo‘ling va <b>✅ Tekshirish</b>ni bosing:",
-            reply_markup=subscribe_kb(channels),
+            "🔒 Овоз бериш учун аввало каналларга обуна бўлинг:",
+            reply_markup=subscribe_kb(channels)
         )
         return
 
     if not await voting_is_open():
-        await c.message.answer("⛔ Ovoz berish yakunlangan.")
+        await c.message.answer(f"🚫 Овоз бериш ёпиқ.\n\n{await remaining_time_text()}")
         return
 
-    await c.message.answer(
-        f"🗳 Nomzod: <b>{row['name']}</b>\n\nOvoz berishni tasdiqlang:",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("✅ Ovoz berish", callback_data=f"vote:{cid}")
-        ),
-    )
+    await c.message.answer(await voting_message_text(), reply_markup=await vote_kb(disabled=False))
 
-@dp.callback_query_handler(lambda c: c.data.startswith("vote:"))
-async def cb_vote(c: types.CallbackQuery):
-    if not await voting_is_open():
-        await c.answer("⛔ Ovoz berish yakunlangan.", show_alert=True)
-        return
-
-    channels = await get_channels()
-    if not await is_subscribed(c.from_user.id):
-        await c.answer("❗ Ovoz berishdan oldin kanallarga obuna bo‘ling.", show_alert=True)
-        await c.message.answer(
-            "❗ Ovoz berish uchun avval quyidagi kanal(lar)ga obuna bo‘ling va <b>✅ Tekshirish</b>ni bosing:",
-            reply_markup=subscribe_kb(channels),
-        )
-        return
-
-    try:
-        cid = int(c.data.split(":")[1])
-    except ValueError:
-        await c.answer("Xatolik", show_alert=True)
-        return
-
-    row = await db_fetchrow("SELECT id, name FROM candidates WHERE id=$1", cid)
-    if not row:
-        await c.answer("Nomzod topilmadi", show_alert=True)
-        return
-
-    # 1 odam = 1 ovoz (UPDATE qilib nomzod almashishini ham xohlasangiz ayting)
-    try:
-        await db_exec(
-            "INSERT INTO votes(user_id, candidate_id, ts) VALUES($1,$2,NOW())",
-            int(c.from_user.id), int(cid)
-        )
-        await c.answer("✅ Ovoz qabul qilindi!", show_alert=True)
-    except asyncpg.UniqueViolationError:
-        await c.answer("❗ Siz allaqachon ovoz bergansiz.", show_alert=True)
-    except Exception:
-        await c.answer("❌ Xatolik. Keyinroq urinib ko‘ring.", show_alert=True)
-
-    # real-time yangilash
-    try:
-        await c.message.edit_text(await voting_message_text(), reply_markup=await live_vote_kb(disabled=False))
-    except Exception:
-        pass
 
 @dp.callback_query_handler(lambda c: c.data == "noop")
 async def cb_noop(c: types.CallbackQuery):
     await c.answer()
 
-# ===================== ADMIN FLOW =====================
+
+# ----------------- VOTE HANDLER -----------------
+@dp.callback_query_handler(lambda c: c.data.startswith("v:"))
+async def cb_vote(c: types.CallbackQuery):
+    # obuna shart (admin ham, user ham)
+    channels = await get_channels()
+    if not await is_subscribed(c.from_user.id):
+        await c.answer("Аввало каналларга обуна бўлинг", show_alert=True)
+        await c.message.answer(
+            "🔒 Давом этиш учун қуйидаги каналларга обуна бўлинг ва <b>✅ Текшириш</b>ни босинг:",
+            reply_markup=subscribe_kb(channels)
+        )
+        return
+
+    if not await voting_is_open():
+        await c.answer("🚫 Овоз бериш ёпиқ", show_alert=True)
+        try:
+            await c.message.edit_reply_markup(reply_markup=await vote_kb(disabled=True))
+        except Exception:
+            pass
+        return
+
+    try:
+        cid = int(c.data.split(":")[1])
+    except Exception:
+        await c.answer("Xato", show_alert=True)
+        return
+
+    # candidate exists?
+    exists = await db_fetchval("SELECT 1 FROM candidates WHERE id=$1", cid)
+    if not exists:
+        await c.answer("❌ Номзод топилмади", show_alert=True)
+        return
+
+    # 1 user = 1 vote (almashtirishga ruxsat: UPDATE)
+    await db_execute("""
+        INSERT INTO votes(user_id, candidate_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id)
+        DO UPDATE SET candidate_id=EXCLUDED.candidate_id, voted_at=NOW()
+    """, c.from_user.id, cid)
+
+    await c.answer("✅ Овозингиз қабул қилинди", show_alert=False)
+
+    # real-time update same message
+    try:
+        await c.message.edit_text(await voting_message_text(), reply_markup=await vote_kb(disabled=False))
+    except Exception:
+        try:
+            await c.message.edit_reply_markup(reply_markup=await vote_kb(disabled=False))
+        except Exception:
+            pass
+
+
+# ----------------- RESULTS: refresh + open candidate fallback -----------------
+@dp.callback_query_handler(lambda c: c.data == "refresh_results")
+async def cb_refresh_results(c: types.CallbackQuery):
+    await c.answer("Янгиланди")
+    text, kb = await results_text_and_buttons()
+    try:
+        await c.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await c.message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("open_c:"))
+async def cb_open_candidate_fallback(c: types.CallbackQuery):
+    await c.answer()
+    cid = int(c.data.split(":")[1])
+    await c.message.answer(f"/start c{cid}")
+
+
+# ----------------- ADMIN COMMANDS -----------------
 @dp.message_handler(commands=["admin"])
 async def cmd_admin(m: types.Message):
     if not is_admin(m.from_user.id):
         return
-    await m.answer("⚙️ <b>Admin panel</b>", reply_markup=admin_kb())
+    await m.answer("⚙️ <b>Админ панел</b>", reply_markup=admin_kb())
 
+
+# ----------------- ADMIN CALLBACKS -----------------
 @dp.callback_query_handler(lambda c: c.data.startswith("a:"))
 async def cb_admin_actions(c: types.CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
-        await c.answer("Kirish yo‘q", show_alert=True)
+        await c.answer("Кириш йўқ", show_alert=True)
         return
 
     action = c.data.split(":", 1)[1]
     await c.answer()
 
-    if action == "add_channel":
+    if action == "back":
+        await c.message.answer("⚙️ <b>Админ панел</b>", reply_markup=admin_kb())
+
+    elif action == "add_channel":
         await AdminState.add_channel.set()
         await c.message.answer(
-            "Kanal qo‘shish.\n\n"
-            "Yuboring:\n"
+            "Канал қўшиш.\n\n"
+            "Юборинг:\n"
             "• <b>@publickanal</b>\n"
-            "yoki\n"
-            "• <b>-1001234567890</b> (private)\n"
-            "yoki\n"
-            "• <b>https://t.me/publickanal</b>\n\n"
-            "Ixtiyoriy: private kanal uchun invite link qo‘shing:\n"
+            "ёки\n"
+            "• <b>https://t.me/publickanal</b>\n"
+            "ёки\n"
+            "• <b>-1001234567890</b> (private)\n\n"
+            "Private учун invite link қўшинг:\n"
             "<code>-100123... https://t.me/+invite</code>"
         )
 
     elif action == "rm_channel":
         await AdminState.remove_channel.set()
-        await c.message.answer("O‘chirish uchun kanalni yuboring: <b>@username</b> yoki <b>-100...</b> yoki <b>https://t.me/username</b>")
+        await c.message.answer("Ўчириш учун канални юборинг: <b>@username</b> ёки <b>https://t.me/username</b> ёки <b>-100...</b>")
 
     elif action == "list_channels":
         rows = await get_channels()
         if not rows:
-            await c.message.answer("Kanallar ro‘yxati bo‘sh.")
+            await c.message.answer("Каналлар йўқ.")
         else:
-            text = "<b>📃 Kanallar:</b>\n"
+            lines = []
             for chat_id, url in rows:
-                text += f"• <code>{chat_id}</code>"
-                if url:
-                    text += f"\n  {url}"
-                text += "\n"
-            await c.message.answer(text)
+                lines.append(f"• <code>{chat_id}</code>" + (f" — {url}" if url else ""))
+            await c.message.answer("📃 <b>Каналлар</b>\n\n" + "\n".join(lines))
 
     elif action == "add_candidate":
-        await AdminState.add_candidate.set()
+        # FSMsiz bulk add
+        ADD_CANDIDATE_MODE.add(c.from_user.id)
         await c.message.answer(
-            "Nomzod qo‘shish.\n\n"
-            "✅ Birdaniga qo‘shish mumkin:\n"
-            "Har qatorga bitta nomzod yozing.\n\n"
-            "Misol:\n"
-            "<code>Davronbek MFY\nShaldiramoq MFY\nTolzor MFY</code>"
+            "📝 Номзод(лар)ни юборинг (har qatorda bittadan).\n\n"
+            "Мисол:\n"
+            "<code>Давронбек МФЙ\nШалдирамоқ МФЙ\nТолзор МФЙ</code>\n\n"
+            "❌ Бекор қилиш: /cancel"
         )
 
     elif action == "rm_candidate":
         await AdminState.remove_candidate.set()
-        await c.message.answer("O‘chirish uchun nomzod ID’sini yuboring (ID ni «📃 Nomzodlar»dan ko‘rasiz).")
+        await c.message.answer(
+            "Ўчириш учун юборинг:\n"
+            "• ID (масалан: <code>7</code>)\n"
+            "ёки\n"
+            "• Тартиб рақам (1/2/3…)\n"
+            "ёки\n"
+            "• Номзод номи (масалан: <code>Ali</code>)"
+        )
 
     elif action == "list_candidates":
         rows = await db_fetch("SELECT id, name FROM candidates ORDER BY id ASC")
         if not rows:
-            await c.message.answer("Nomzodlar yo‘q.")
+            await c.message.answer("Номзодлар йўқ.")
         else:
-            text = "<b>📃 Nomzodlar:</b>\n"
-            for idx, r in enumerate(rows, start=1):
-                text += f'{idx}. "{r["name"]}" (ID: {r["id"]})\n'
-            await c.message.answer(text)
+            txt = "\n".join([f"{i}. {r['name']} (ID: {r['id']})" for i, r in enumerate(rows, start=1)])
+            await c.message.answer("📃 <b>Номзодлар</b>\n\n" + txt)
 
     elif action == "set_timer":
         await AdminState.set_timer.set()
-        await c.message.answer(
-            "Taymer o‘rnatish (daqiqada).\n"
-            "Masalan: <code>60</code> (60 daqiqa)\n\n"
-            "⚠️ Taymer tugasa ovoz berish yopiladi."
-        )
+        await c.message.answer("Таймер ўрнатиш (daq). Масалан: <code>60</code>")
 
-    elif action == "stop_timer":
-        await db_exec("DELETE FROM settings WHERE key='end_time_utc'")
-        await c.message.answer("🛑 Taymer o‘chirildi. Ovoz berish ochiq (cheklanmagan).")
+    elif action == "timer_stop":
+        await set_setting("end_time_utc", now_utc().isoformat())
+        await c.message.answer("🛑 Таймер тўхтатилди. Овоз бериш ёпилди.")
 
     elif action == "reset_votes":
-        await db_exec("DELETE FROM votes")
-        await c.message.answer("🗑 Barcha ovozlar 0 qilindi.")
+        await db_execute("TRUNCATE votes")
+        await c.message.answer("🗑 Овозлар 0 қилинди.")
+
+    elif action == "export_csv":
+        # export votes.csv
+        rows = await db_fetch("""
+            SELECT v.user_id, v.candidate_id, c.name AS candidate_name, v.voted_at
+            FROM votes v JOIN candidates c ON c.id=v.candidate_id
+            ORDER BY v.voted_at DESC
+        """)
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["user_id", "candidate_id", "candidate_name", "voted_at"])
+        for r in rows:
+            w.writerow([r["user_id"], r["candidate_id"], r["candidate_name"], r["voted_at"].isoformat()])
+        data = out.getvalue().encode("utf-8")
+        f = types.InputFile(io.BytesIO(data), filename="votes.csv")
+        await c.message.answer_document(f, caption="📤 votes.csv")
 
     elif action == "results":
-        text, kb = await results_text_and_kb()
+        text, kb = await results_text_and_buttons()
         await c.message.answer(text, reply_markup=kb)
 
+    else:
+        await c.message.answer("Номаълум амал")
+
+
+# ----------------- ADMIN: BULK ADD NOMZOD (FSMsiz) -----------------
+@dp.message_handler(lambda m: m.from_user and m.from_user.id in ADD_CANDIDATE_MODE)
+async def add_candidates_auto(m: types.Message):
+    if not is_admin(m.from_user.id):
+        ADD_CANDIDATE_MODE.discard(m.from_user.id)
+        return
+
+    text = (m.text or "").strip()
+
+    if text.lower() == "/cancel":
+        ADD_CANDIDATE_MODE.discard(m.from_user.id)
+        await m.answer("❌ Бекор қилинди.")
+        return
+
+    names = [x.strip() for x in text.split("\n") if x.strip()]
+    if not names:
+        await m.answer("⚠️ Номзод номларини юборинг (har qatorda bittadan).")
+        return
+
+    added = 0
+    skipped = 0
+
+    async with db_pool.acquire() as conn:
+        for name in names:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM candidates WHERE LOWER(name)=LOWER($1)",
+                name
+            )
+            if exists:
+                skipped += 1
+                continue
+            await conn.execute("INSERT INTO candidates(name) VALUES($1)", name)
+            added += 1
+
+    ADD_CANDIDATE_MODE.discard(m.from_user.id)
+    await m.answer(
+        f"✅ Қўшилди: {added}\n"
+        f"⚠️ Такрор бўлгани учун ўтказиб юборилди: {skipped}",
+        reply_markup=admin_kb()
+    )
+
+@dp.message_handler(commands=["cancel"])
+async def cancel_any(m: types.Message):
+    if m.from_user and m.from_user.id in ADD_CANDIDATE_MODE:
+        ADD_CANDIDATE_MODE.discard(m.from_user.id)
+        await m.answer("❌ Бекор қилинди.")
+        return
+
+
+# ----------------- ADMIN: ADD/REMOVE CHANNEL (FSM) -----------------
 @dp.message_handler(state=AdminState.add_channel)
 async def st_add_channel(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
+        await state.finish()
         return
+
     try:
-        chat_id, join_url = parse_channel_input(m.text)
-        await db_exec("INSERT INTO channels(chat_id, join_url) VALUES($1,$2) ON CONFLICT (chat_id) DO UPDATE SET join_url=EXCLUDED.join_url",
-                      chat_id, join_url)
-        await m.answer(f"✅ Kanal qo‘shildi: <code>{chat_id}</code>" + (f"\n{join_url}" if join_url else ""))
-        await m.answer("⚠️ Obuna tekshirish ishlashi uchun botni shu kanalga ADMIN qilib qo‘ying.")
-    except Exception as e:
-        await m.answer(f"❌ Xatolik. Formatni tekshiring.\n<i>{e}</i>")
+        chat_id, join_url = normalize_channel_input(m.text)
+    except Exception:
+        await m.answer("❌ Канал формати нотўғри. Масалан: @kanal ёки https://t.me/kanal")
+        await state.finish()
+        return
+
+    await db_execute("""
+        INSERT INTO channels(chat_id, join_url)
+        VALUES($1, $2)
+        ON CONFLICT (chat_id) DO UPDATE SET join_url=EXCLUDED.join_url
+    """, chat_id, join_url)
+
     await state.finish()
+    await m.answer(f"✅ Канал қўшилди: <b>{chat_id}</b>", reply_markup=admin_kb())
+    await m.answer("⚠️ Обуна текшируви ишлаши учун ботни каналга ADMIN қилинг.")
 
 @dp.message_handler(state=AdminState.remove_channel)
 async def st_rm_channel(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
+        await state.finish()
         return
-    text = m.text.strip()
+
+    raw = m.text.strip()
+    # URL bo‘lsa normalize qilamiz
     try:
-        chat_id, _join = parse_channel_input(text)
+        chat_id, _url = normalize_channel_input(raw)
     except Exception:
-        chat_id = text
-    await db_exec("DELETE FROM channels WHERE chat_id=$1", chat_id)
-    await m.answer(f"✅ Kanal o‘chirildi (bo‘lgan bo‘lsa): <code>{chat_id}</code>")
+        chat_id = raw.split()[0]
+
+    await db_execute("DELETE FROM channels WHERE chat_id=$1", chat_id)
     await state.finish()
+    await m.answer(f"✅ Канал ўчирилди (бор бўлса): <b>{chat_id}</b>", reply_markup=admin_kb())
 
-@dp.message_handler(state=AdminState.add_candidate)
-async def st_add_candidate(m: types.Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
 
-    lines = [ln.strip() for ln in (m.text or "").splitlines()]
-    names = [ln for ln in lines if ln]
-
-    if not names:
-        await m.answer("❌ Hech narsa topilmadi. Har qatorda bitta nomzod bo‘lsin.")
-        return
-
-    async with pool.acquire() as con:
-        async with con.transaction():
-            for name in names:
-                await con.execute("INSERT INTO candidates(name) VALUES($1)", name)
-
-    await m.answer(f"✅ Nomzod(lar) qo‘shildi: <b>{len(names)}</b> ta")
-    # ro‘yxatdan qisqa preview
-    preview = "\n".join([f"• {n}" for n in names[:10]])
-    if len(names) > 10:
-        preview += "\n..."
-    await m.answer(f"<b>Preview:</b>\n{preview}")
-    await state.finish()
-
+# ----------------- ADMIN: REMOVE NOMZOD (ID yoki tartib raqam) -----------------
 @dp.message_handler(state=AdminState.remove_candidate)
 async def st_rm_candidate(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
+        await state.finish()
         return
-    try:
-        cid = int(m.text.strip())
-    except ValueError:
-        await m.answer("❌ ID raqam bo‘lishi kerak. Masalan: <code>3</code>")
-        return
-    await db_exec("DELETE FROM candidates WHERE id=$1", cid)
-    await m.answer(f"✅ Nomzod o‘chirildi (bo‘lgan bo‘lsa): <code>{cid}</code>")
-    await state.finish()
 
+    raw = m.text.strip()
+
+    # raqam bo‘lsa: avval ID deb urinadi, bo‘lmasa tartib raqami (1/2/3...)
+    if raw.isdigit():
+        n = int(raw)
+
+        async with db_pool.acquire() as conn:
+            res = await conn.execute("DELETE FROM candidates WHERE id=$1", n)
+            deleted = int(res.split()[-1])
+            if deleted == 1:
+                await state.finish()
+                await m.answer(f"✅ Номзод ўчирилди: ID <b>{n}</b>", reply_markup=admin_kb())
+                return
+
+            row = await conn.fetchrow("""
+                SELECT id, name
+                FROM candidates
+                ORDER BY id ASC
+                OFFSET $1
+                LIMIT 1
+            """, n - 1)
+
+            if not row:
+                await state.finish()
+                await m.answer("❌ Бундай тартиб рақамдаги номзод топилмади.", reply_markup=admin_kb())
+                return
+
+            cid = int(row["id"])
+            name = str(row["name"])
+            await conn.execute("DELETE FROM candidates WHERE id=$1", cid)
+
+        await state.finish()
+        await m.answer(f"✅ Номзод ўчирилди: <b>{n}. {name}</b> (ID: {cid})", reply_markup=admin_kb())
+        return
+
+    # name bo‘yicha
+    res = await db_execute("DELETE FROM candidates WHERE LOWER(name)=LOWER($1)", raw)
+    deleted = int(res.split()[-1])
+
+    await state.finish()
+    if deleted:
+        await m.answer(f"✅ Номзод ўчирилди: <b>{raw}</b>", reply_markup=admin_kb())
+    else:
+        await m.answer("❌ Номзод топилмади (номни текширинг).", reply_markup=admin_kb())
+
+
+# ----------------- ADMIN: SET TIMER (FSM) -----------------
 @dp.message_handler(state=AdminState.set_timer)
 async def st_set_timer(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
-        return
-    try:
-        mins = int(m.text.strip())
-        if mins <= 0:
-            raise ValueError()
-    except ValueError:
-        await m.answer("❌ Daqiqa musbat son bo‘lsin. Masalan: <code>30</code>")
+        await state.finish()
         return
 
-    end_time = now_utc() + timedelta(minutes=mins)
-    await db_exec(
-        "INSERT INTO settings(key, value) VALUES('end_time_utc', $1) "
-        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
-        end_time.isoformat()
-    )
-    await m.answer(f"⏳ Taymer o‘rnatildi: <b>{mins}</b> daqiqa.\n{await remaining_time_text()}")
+    raw = m.text.strip()
+    if not raw.isdigit():
+        await m.answer("Фақат рақам юборинг. Масалан: <code>60</code>")
+        return
+
+    minutes = int(raw)
+    if minutes <= 0:
+        await m.answer("0 дан катта бўлсин.")
+        return
+
+    end_time = now_utc() + timedelta(minutes=minutes)
+    await set_setting("end_time_utc", end_time.isoformat())
+
     await state.finish()
+    await m.answer(f"✅ Таймер ўрнатилди: <b>{minutes} дақиқа</b>\n{await remaining_time_text()}", reply_markup=admin_kb())
 
-# ===================== STARTUP =====================
-async def on_startup(_dp: Dispatcher):
-    global pool
-    pool = await asyncpg.create_pool(
+
+# ----------------- DB INIT -----------------
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=1,
         max_size=10,
         command_timeout=30,
     )
-    async with pool.acquire() as con:
-        await con.execute(DDL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS channels(
+                chat_id TEXT PRIMARY KEY,
+                join_url TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidates(
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS votes(
+                user_id BIGINT PRIMARY KEY,
+                candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+                voted_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
+
+
+# ----------------- STARTUP / SHUTDOWN -----------------
+async def on_startup(_dp: Dispatcher):
+    await init_db()
+    print("DB: POSTGRES | READY")
+    print("BOT STARTED")
 
 async def on_shutdown(_dp: Dispatcher):
-    if pool:
-        await pool.close()
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        db_pool = None
 
-# ===================== RUN =====================
+
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
