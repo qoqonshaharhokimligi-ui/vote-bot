@@ -31,12 +31,14 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 
 db_pool: Optional[asyncpg.Pool] = None
 
+
 # FSM faqat remove/timer/channel uchun
 class AdminState(StatesGroup):
     add_channel = State()
     remove_channel = State()
     remove_candidate = State()
     set_timer = State()
+
 
 # FSMsiz bulk add uchun "mode"
 ADD_CANDIDATE_MODE = set()  # admin user_id lar
@@ -46,23 +48,28 @@ ADD_CANDIDATE_MODE = set()  # admin user_id lar
 def is_admin(uid: int) -> bool:
     return uid in ADMINS
 
+
 def now_utc() -> datetime:
     return datetime.now(UTC)
+
 
 async def db_fetch(query: str, *args):
     assert db_pool is not None
     async with db_pool.acquire() as conn:
         return await conn.fetch(query, *args)
 
+
 async def db_fetchrow(query: str, *args):
     assert db_pool is not None
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(query, *args)
 
+
 async def db_fetchval(query: str, *args):
     assert db_pool is not None
     async with db_pool.acquire() as conn:
         return await conn.fetchval(query, *args)
+
 
 async def db_execute(query: str, *args):
     assert db_pool is not None
@@ -74,14 +81,20 @@ async def db_execute(query: str, *args):
 async def get_setting(key: str) -> Optional[str]:
     return await db_fetchval("SELECT value FROM settings WHERE key=$1", key)
 
+
 async def set_setting(key: str, value: Optional[str]) -> None:
     if value is None:
         await db_execute("DELETE FROM settings WHERE key=$1", key)
         return
-    await db_execute("""
+    await db_execute(
+        """
         INSERT INTO settings(key, value) VALUES($1, $2)
         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
-    """, key, value)
+        """,
+        key,
+        value,
+    )
+
 
 async def get_end_time() -> Optional[datetime]:
     v = await get_setting("end_time_utc")
@@ -92,11 +105,13 @@ async def get_end_time() -> Optional[datetime]:
     except Exception:
         return None
 
+
 async def voting_is_open() -> bool:
     end_time = await get_end_time()
     if not end_time:
         return True
     return now_utc() < end_time
+
 
 async def remaining_time_text() -> str:
     end_time = await get_end_time()
@@ -152,6 +167,7 @@ async def get_channels() -> List[Tuple[str, Optional[str]]]:
     rows = await db_fetch("SELECT chat_id, join_url FROM channels ORDER BY created_at DESC")
     return [(str(r["chat_id"]), (str(r["join_url"]) if r["join_url"] else None)) for r in rows]
 
+
 async def is_subscribed(user_id: int) -> bool:
     channels = await get_channels()
     if not channels:
@@ -166,6 +182,7 @@ async def is_subscribed(user_id: int) -> bool:
             # bot kanalga admin bo‘lmasa yoki chat_id noto‘g‘ri bo‘lsa
             return False
     return True
+
 
 def subscribe_kb(channels: List[Tuple[str, Optional[str]]]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
@@ -188,22 +205,27 @@ def subscribe_kb(channels: List[Tuple[str, Optional[str]]]) -> InlineKeyboardMar
 
 # ----------------- VOTE UI (REAL-TIME COUNTS) -----------------
 async def candidates_with_counts() -> List[Tuple[int, str, int]]:
-    rows = await db_fetch("""
+    rows = await db_fetch(
+        """
         SELECT c.id, c.name, COUNT(v.user_id) AS cnt
         FROM candidates c
         LEFT JOIN votes v ON v.candidate_id = c.id
         GROUP BY c.id, c.name
         ORDER BY c.id ASC
-    """)
+        """
+    )
     return [(int(r["id"]), str(r["name"]), int(r["cnt"])) for r in rows]
+
 
 async def total_votes() -> int:
     v = await db_fetchval("SELECT COUNT(*) FROM votes")
     return int(v or 0)
 
+
 def safe_btn_text(s: str, max_len: int = 60) -> str:
     s = s.replace("\n", " ").strip()
     return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+
 
 async def vote_kb(disabled: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
@@ -221,6 +243,7 @@ async def vote_kb(disabled: bool = False) -> InlineKeyboardMarkup:
         kb.add(InlineKeyboardButton(text=text, callback_data=cb))
 
     return kb
+
 
 async def voting_message_text() -> str:
     open_state = "✅ Овоз бериш: <b>очиқ</b>" if await voting_is_open() else "🚫 Овоз бериш: <b>ёпиқ</b>"
@@ -325,7 +348,7 @@ async def cmd_start(m: types.Message):
         if not await is_subscribed(m.from_user.id):
             await m.answer(
                 "🔒 Давом этиш учун қуйидаги каналларга обуна бўлинг ва <b>✅ Текшириш</b>ни босинг:",
-                reply_markup=subscribe_kb(channels)
+                reply_markup=subscribe_kb(channels),
             )
             return
 
@@ -351,7 +374,7 @@ async def cmd_start(m: types.Message):
     if not await is_subscribed(m.from_user.id):
         await m.answer(
             "🔒 Давом этиш учун қуйидаги каналларга обуна бўлинг ва <b>✅ Текшириш</b>ни босинг:",
-            reply_markup=subscribe_kb(channels)
+            reply_markup=subscribe_kb(channels),
         )
         return
 
@@ -381,10 +404,7 @@ async def cb_open_vote(c: types.CallbackQuery):
     await c.answer()
     channels = await get_channels()
     if not await is_subscribed(c.from_user.id):
-        await c.message.answer(
-            "🔒 Овоз бериш учун аввало каналларга обуна бўлинг:",
-            reply_markup=subscribe_kb(channels)
-        )
+        await c.message.answer("🔒 Овоз бериш учун аввало каналларга обуна бўлинг:", reply_markup=subscribe_kb(channels))
         return
 
     if not await voting_is_open():
@@ -408,7 +428,7 @@ async def cb_vote(c: types.CallbackQuery):
         await c.answer("Аввало каналларга обуна бўлинг", show_alert=True)
         await c.message.answer(
             "🔒 Давом этиш учун қуйидаги каналларга обуна бўлинг ва <b>✅ Текшириш</b>ни босинг:",
-            reply_markup=subscribe_kb(channels)
+            reply_markup=subscribe_kb(channels),
         )
         return
 
@@ -433,12 +453,16 @@ async def cb_vote(c: types.CallbackQuery):
         return
 
     # 1 user = 1 vote (almashtirishga ruxsat: UPDATE)
-    await db_execute("""
+    await db_execute(
+        """
         INSERT INTO votes(user_id, candidate_id)
         VALUES ($1, $2)
         ON CONFLICT (user_id)
         DO UPDATE SET candidate_id=EXCLUDED.candidate_id, voted_at=NOW()
-    """, c.from_user.id, cid)
+        """,
+        c.from_user.id,
+        cid,
+    )
 
     await c.answer("✅ Овозингиз қабул қилинди", show_alert=False)
 
@@ -461,6 +485,7 @@ async def cb_refresh_results(c: types.CallbackQuery):
         await c.message.edit_text(text, reply_markup=kb)
     except Exception:
         await c.message.answer(text, reply_markup=kb)
+
 
 @dp.callback_query_handler(lambda c: c.data.startswith("open_c:"))
 async def cb_open_candidate_fallback(c: types.CallbackQuery):
@@ -557,15 +582,17 @@ async def cb_admin_actions(c: types.CallbackQuery, state: FSMContext):
 
     elif action == "reset_votes":
         await db_execute("TRUNCATE votes")
-        await c.message.answer("🗑 Овозлар 0 қилинди.")
+        await c.message.answer("🗑 Оvozlar 0 қилинди.")
 
     elif action == "export_csv":
         # export votes.csv
-        rows = await db_fetch("""
+        rows = await db_fetch(
+            """
             SELECT v.user_id, v.candidate_id, c.name AS candidate_name, v.voted_at
             FROM votes v JOIN candidates c ON c.id=v.candidate_id
             ORDER BY v.voted_at DESC
-        """)
+            """
+        )
         out = io.StringIO()
         w = csv.writer(out)
         w.writerow(["user_id", "candidate_id", "candidate_name", "voted_at"])
@@ -607,10 +634,7 @@ async def add_candidates_auto(m: types.Message):
 
     async with db_pool.acquire() as conn:
         for name in names:
-            exists = await conn.fetchval(
-                "SELECT 1 FROM candidates WHERE LOWER(name)=LOWER($1)",
-                name
-            )
+            exists = await conn.fetchval("SELECT 1 FROM candidates WHERE LOWER(name)=LOWER($1)", name)
             if exists:
                 skipped += 1
                 continue
@@ -619,10 +643,10 @@ async def add_candidates_auto(m: types.Message):
 
     ADD_CANDIDATE_MODE.discard(m.from_user.id)
     await m.answer(
-        f"✅ Қўшилди: {added}\n"
-        f"⚠️ Такрор бўлгани учун ўтказиб юборилди: {skipped}",
-        reply_markup=admin_kb()
+        f"✅ Қўшилди: {added}\n" f"⚠️ Такрор бўлгани учун ўтказиб юборилди: {skipped}",
+        reply_markup=admin_kb(),
     )
+
 
 @dp.message_handler(commands=["cancel"])
 async def cancel_any(m: types.Message):
@@ -646,15 +670,20 @@ async def st_add_channel(m: types.Message, state: FSMContext):
         await state.finish()
         return
 
-    await db_execute("""
+    await db_execute(
+        """
         INSERT INTO channels(chat_id, join_url)
         VALUES($1, $2)
         ON CONFLICT (chat_id) DO UPDATE SET join_url=EXCLUDED.join_url
-    """, chat_id, join_url)
+        """,
+        chat_id,
+        join_url,
+    )
 
     await state.finish()
     await m.answer(f"✅ Канал қўшилди: <b>{chat_id}</b>", reply_markup=admin_kb())
     await m.answer("⚠️ Обуна текшируви ишлаши учун ботни каналга ADMIN қилинг.")
+
 
 @dp.message_handler(state=AdminState.remove_channel)
 async def st_rm_channel(m: types.Message, state: FSMContext):
@@ -695,13 +724,16 @@ async def st_rm_candidate(m: types.Message, state: FSMContext):
                 await m.answer(f"✅ Номзод ўчирилди: ID <b>{n}</b>", reply_markup=admin_kb())
                 return
 
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT id, name
                 FROM candidates
                 ORDER BY id ASC
                 OFFSET $1
                 LIMIT 1
-            """, n - 1)
+                """,
+                n - 1,
+            )
 
             if not row:
                 await state.finish()
@@ -761,33 +793,83 @@ async def init_db():
         command_timeout=30,
     )
     async with db_pool.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS channels(
                 chat_id TEXT PRIMARY KEY,
                 join_url TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
-        """)
-        await conn.execute("""
+            """
+        )
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS candidates(
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
-        """)
-        await conn.execute("""
+            """
+        )
+
+        # --- votes table: auto-migrate old schema ---
+        # Create if not exists (fresh DB)
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS votes(
                 user_id BIGINT PRIMARY KEY,
                 candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
                 voted_at TIMESTAMPTZ DEFAULT NOW()
             );
-        """)
-        await conn.execute("""
+            """
+        )
+
+        # If votes existed earlier with old schema, ensure columns exist
+        has_candidate_id = await conn.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name='votes' AND column_name='candidate_id'
+            );
+            """
+        )
+
+        # If old votes schema: recreate (drops old votes)
+        if not has_candidate_id:
+            print("DB MIGRATION: old votes schema detected (no candidate_id). Recreating votes table...")
+            await conn.execute("DROP TABLE IF EXISTS votes;")
+            await conn.execute(
+                """
+                CREATE TABLE votes(
+                    user_id BIGINT PRIMARY KEY,
+                    candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+                    voted_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+        else:
+            # Ensure voted_at exists too
+            has_voted_at = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='votes' AND column_name='voted_at'
+                );
+                """
+            )
+            if not has_voted_at:
+                await conn.execute("ALTER TABLE votes ADD COLUMN voted_at TIMESTAMPTZ DEFAULT NOW();")
+
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS settings(
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
-        """)
+            """
+        )
 
 
 # ----------------- STARTUP / SHUTDOWN -----------------
@@ -795,6 +877,7 @@ async def on_startup(_dp: Dispatcher):
     await init_db()
     print("DB: POSTGRES | READY")
     print("BOT STARTED")
+
 
 async def on_shutdown(_dp: Dispatcher):
     global db_pool
